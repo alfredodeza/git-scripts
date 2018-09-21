@@ -1,0 +1,432 @@
+#!/usr/bin/env python
+
+from __future__ import print_function
+import json
+import os
+import urllib2
+import subprocess
+import sys
+import time
+from jenkins import Jenkins
+
+with_url = '--url' in sys.argv
+with_passing = '--passing' in sys.argv
+with_failing = '--failing' in sys.argv
+default_reporting = not(with_passing and with_failing)
+
+##### HARD CODED STUFF
+JENKINS_URL = 'https://jenkins.ceph.com'
+JENKINS_USERNAME = 'USER'
+JENKINS_TOKEN = "SECRET"
+
+jobs = [
+    # tox
+    "ceph-volume-pr",
+
+    # lvm bluestore,
+    "ceph-volume-prs-lvm-centos7-bluestore-create",
+    "ceph-volume-prs-lvm-xenial-bluestore-create",
+    "ceph-volume-prs-lvm-centos7-bluestore-dmcrypt",
+    "ceph-volume-prs-lvm-xenial-bluestore-dmcrypt",
+
+    # lvm filestore,
+    "ceph-volume-prs-lvm-centos7-filestore-create",
+    "ceph-volume-prs-lvm-xenial-filestore-create",
+    "ceph-volume-prs-lvm-centos7-filestore-dmcrypt",
+    "ceph-volume-prs-lvm-xenial-filestore-dmcrypt",
+
+    # batch bluestore,
+    "ceph-volume-prs-batch-centos7-bluestore-single_type",
+    "ceph-volume-prs-batch-xenial-bluestore-single_type",
+    "ceph-volume-prs-batch-centos7-bluestore-single_type_dmcrypt",
+    "ceph-volume-prs-batch-xenial-bluestore-single_type_dmcrypt",
+    "ceph-volume-prs-batch-centos7-bluestore-mixed_type_dmcrypt",
+    "ceph-volume-prs-batch-centos7-bluestore-mixed_type",
+
+    # batch filestore,
+    "ceph-volume-prs-batch-centos7-filestore-single_type",
+    "ceph-volume-prs-batch-xenial-filestore-single_type",
+    "ceph-volume-prs-batch-centos7-filestore-single_type_dmcrypt",
+    "ceph-volume-prs-batch-xenial-filestore-single_type_dmcrypt",
+    "ceph-volume-prs-batch-centos7-filestore-mixed_type_dmcrypt",
+    "ceph-volume-prs-batch-centos7-filestore-mixed_type",
+
+    # simple bluestore,
+    "ceph-volume-prs-simple-centos7-bluestore-dmcrypt_luks",
+    "ceph-volume-prs-simple-xenial-bluestore-dmcrypt_luks",
+    "ceph-volume-prs-simple-centos7-bluestore-dmcrypt_plain",
+    "ceph-volume-prs-simple-xenial-bluestore-dmcrypt_plain",
+    "ceph-volume-prs-simple-centos7-bluestore-activate",
+    "ceph-volume-prs-simple-xenial-bluestore-activate",
+
+    # simple filestore,
+    "ceph-volume-prs-simple-centos7-filestore-dmcrypt_luks",
+    "ceph-volume-prs-simple-xenial-filestore-dmcrypt_luks",
+    "ceph-volume-prs-simple-centos7-filestore-dmcrypt_plain",
+    "ceph-volume-prs-simple-xenial-filestore-dmcrypt_plain",
+    "ceph-volume-prs-simple-centos7-filestore-activate",
+    "ceph-volume-prs-simple-xenial-filestore-activate",
+]
+
+
+def jenkins_connect():
+    connection = Jenkins(
+        JENKINS_URL,
+        username=JENKINS_USERNAME,
+        password=JENKINS_TOKEN,
+    )
+    connection.password = JENKINS_TOKEN
+
+    # try an actual request so we can bail if something is off
+    connection.get_info()
+
+    return connection
+
+
+class colorize(str):
+    """
+    Pretty simple to use::
+
+        colorize.make('foo').bold
+        colorize.make('foo').green
+        colorize.make('foo').yellow
+        colorize.make('foo').red
+        colorize.make('foo').blue
+
+    Otherwise you could go the long way (for example if you are
+    testing this class)::
+
+        string = colorize('foo')
+        string._set_attributes()
+        string.red
+
+    """
+
+    def __init__(self, string):
+        self.stdout = sys.__stdout__
+        self.appends = ''
+        self.prepends = ''
+        self.isatty = self.stdout.isatty()
+
+    def _set_attributes(self):
+        """
+        Sets the attributes here because the str class does not
+        allow to pass in anything other than a string to the constructor
+        so we can't really mess with the other attributes.
+        """
+        for k, v in self.__colors__.items():
+            setattr(self, k, self.make_color(v))
+
+    def make_color(self, color):
+        if not self.isatty:
+            return self
+        return color + self + '\033[0m' + self.appends
+
+    @property
+    def __colors__(self):
+        return dict(
+            blue='\033[34m',
+            green='\033[92m',
+            yellow='\033[33m',
+            red='\033[91m',
+            bold='\033[1m',
+            ends='\033[0m'
+        )
+
+    @classmethod
+    def make(cls, string):
+        """
+        A helper method to return itself and workaround the fact that
+        the str object doesn't allow extra arguments passed in to the
+        constructor
+        """
+        obj = cls(string)
+        obj._set_attributes()
+        return obj
+
+
+GITHUB_URL = "https://api.github.com/repos/{repo}/statuses/{sha}"
+GITHUB_PULL_URL = "https://api.github.com/repos/{project}/{repo}/pulls?head={head}"
+GITHUB_FORK_PULL_URL = "https://api.github.com/repos/{project}/{repo}/pulls?head={head}"
+
+
+def run(cmd):
+    process = subprocess.Popen(
+        cmd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        stdin=subprocess.PIPE,
+        close_fds=True
+    )
+    returncode = process.wait()
+    if returncode != 0:
+        print("Non-zero exit status from calling command %s" % ' '.join(cmd))
+
+    return process.stdout.read(), process.stderr.read(), returncode
+
+
+def get_repository(origin_url):
+    if '@' in origin_url:
+        # e.g. something like git@github.com:ceph/ceph.git
+        return origin_url.split(':')[-1].split('.git')[0].split('/')[-1]
+    else: # assumes http like https://github.com/ceph/ceph
+        return origin_url.split('.com')[-1].strip('/').split('/')[-1]
+
+
+def get_project(origin_url):
+    if '@' in origin_url:
+        # e.g. something like git@github.com:ceph/ceph.git
+        return origin_url.split(':')[-1].split('/')[0]
+    else: # assumes http like https://github.com/ceph/ceph
+        return origin_url.split('.com')[-1].strip('/').split('/')[0]
+
+
+def current_branch():
+    stdout, _, _ = run(['git', 'rev-parse', '--abbrev-ref', 'HEAD'])
+    return stdout.strip('\n')
+
+
+def get_head_param(origin_url):
+    """
+    The API for querying pull requests can be refined with a ``head`` query. The docs say::
+
+        Filter pulls by head user and branch name in the format of user:ref-name
+
+    This function *does not* use the Git "head".
+    """
+    user = os.getenv('GITHUB_USER', '')
+    if user:
+        return "%s:%s" % (user, current_branch())
+
+    if '@' in origin_url:
+        # e.g. something like git@github.com:ceph/ceph.git
+        user = origin_url.split(':')[-1].split('/')[0]
+    else: # assumes http like https://github.com/ceph/ceph
+        user = origin_url.split('.com')[-1].strip('/').split('/')[0]
+    print("%s:%s" % (user, current_branch()))
+    return "%s:%s" % (user, current_branch())
+
+
+def latest_sha1():
+    stdout, _, _ = run(['git', 'rev-parse', 'HEAD'])
+    return stdout.strip('\n')
+
+
+def github_token():
+    with open(os.path.expanduser('~/.github_token'), 'r') as fp:
+        return fp.read().strip()
+
+
+def parse_pull_request(json, branch=None):
+    """
+    From the JSON output, parse out the pull request id so that it can be used
+    by Jenkins jobs that require the pull request in the form of::
+
+        origin/pr/72/head
+
+"head": {
+      "label": "thmour:thmour_parallel_create",
+      "ref": "thmour_parallel_create",
+    """
+    if isinstance(json, list):
+        for pr in json:
+            if pr['head']['ref'] == branch:
+                url = pr['html_url']
+    else:
+        try:
+            # XXX assumes the first one is the one we want, might need to further improve this
+            # to verify it is correct
+            url = json[0]['html_url']
+        except KeyError:
+            raise SystemExit('Unable to parse html_url from json')
+
+    pr_id = url.split('/')[-1]
+    return 'origin/pr/%s/head' % pr_id
+
+
+def report(test):
+    state_color = state.get(test['state'], 'pending')
+    context = state_color(test.get('context', '?'))
+    if with_url:
+        print(context)
+        print('    ', test.get('target_url'))
+    else:
+        print(context)
+
+
+def job_is_parametrized(job_info):
+    """
+    If a job is parametrized but no arguments are passed in, then
+    python-jenkins will use a different URL to trigger the job (vs. using the
+    url that indicates the job is parametrized) causing builds to error and not
+    get started.
+
+    This check helps by looking into the job_config to determine if the job is
+    in fact parametrized so that we can add a bogus param and trick
+    python-jenkins in using the correct URL
+    """
+    actions = job_info.get('actions', [])
+    if not actions:
+        return False
+    for action in actions:
+        if action.get('parameterDefinitions'):
+            return True
+
+
+def parse_arg_tags(tags):
+    """
+    Parse tags that come from argv, regardless of space or comma separated
+    """
+    parsed_tags = []
+    for tag in tags:
+        parsed_tags.extend(tag.split(','))
+    return [i.strip() for i in parsed_tags if i]
+
+
+def test_list(tagged_jobs, informational=True):
+    jobs = []
+    if 'list' in sys.argv:
+        unsplit_tags = sys.argv[sys.argv.index('list') + 1:]
+    else: # assume that we are testing for specific tags:
+        unsplit_tags = sys.argv[sys.argv.index('test') + 1:]
+    if not unsplit_tags:
+        if not informational:
+            return tagged_jobs.keys()
+        # list everything
+        for job in tagged_jobs.keys():
+            print(job)
+    else:
+        tags = parse_arg_tags(unsplit_tags)
+        for job, job_description in tagged_jobs.items():
+            mismatch = False
+            for tag in tags:
+                if tag not in job_description['tags']:
+                    mismatch = True
+            if not mismatch:
+                jobs.append(job)
+        if informational:
+            for job in set(jobs):
+                print(job)
+        return set(jobs)
+
+
+def pr_json(pull_url):
+    req = urllib2.Request(pull_url)
+    req.add_header('Authorization', 'bearer %s' % github_token())
+    try:
+        resp = urllib2.urlopen(req)
+    except Exception as error:
+        print(error)
+        print(pull_url)
+        return []
+    content = resp.read()
+    return json.loads(content)
+
+
+def main_test():
+    branch = current_branch()
+    origin_url, _, _ = run(['git', 'config', 'remote.origin.url'])
+    upstream_url, _, _ = run(['git', 'config', 'remote.upstream.url'])
+    origin_project = get_project(origin_url) or 'ceph'
+    upstream_project = get_project(upstream_url) or 'ceph'
+    repo = get_repository(origin_url)
+    head = get_head_param(origin_url)
+    upstream_head = get_head_param(upstream_url)
+    tagged_jobs = {}
+    for job in jobs:
+        tagged_jobs[job] = {'tags': []}
+        job_tags = tagged_jobs[job]['tags']
+        for tag in job.split('-'):
+            job_tags.append(tag)
+            if '_' in tag:
+                job_tags.extend(tag.split('_'))
+    if 'list' in sys.argv:
+        return test_list(tagged_jobs)
+
+    PULL_URL = GITHUB_PULL_URL.format(project=origin_project, repo=repo, head=head)
+    json_response = pr_json(PULL_URL)
+
+    if json_response == []:
+        PULL_URL = GITHUB_FORK_PULL_URL.format(project=upstream_project, repo=repo, head=head)
+        json_response = pr_json(PULL_URL)
+
+    # try with just the upstream
+    if json_response == []:
+        PULL_URL = GITHUB_FORK_PULL_URL.format(project=upstream_project, repo=repo, head=upstream_head)
+        json_response = pr_json(PULL_URL)
+
+    # give up with no json to work with
+    if json_response == []:
+        print("unable to gather JSON from PR %s" % PULL_URL)
+        raise SystemExit(1)
+    target_branch = json_response[0]['base']['ref']
+    job_selection = test_list(tagged_jobs, informational=False)
+    jenkins_conn = jenkins_connect()
+    #info = jenkins_conn.get_job_info(job_selection[0])
+    #is_parametrized = job_is_parametrized(info)
+    is_parametrized = True
+    parameters = {
+        'ghprbTargetBranch': target_branch, 'ghprbSourceBranch': branch, 
+        'sha1': parse_pull_request(json_response, branch=branch), 'GITHUB_SHA': latest_sha1()
+    }
+    if is_parametrized:
+        parameters['__bogus_param__'] = "1"
+    print("Pull Request URL: %s" % json_response[0]['html_url'])
+    for job_name in job_selection:
+        print('Requesting test for job: %s' % job_name)
+        jenkins_conn.build_job(job_name, parameters=parameters, token=jenkins_conn.password)
+
+
+def main():
+    if 'test' in sys.argv:
+        return main_test()
+
+    origin_url, _, _ = run(['git', 'config', 'remote.origin.url'])
+    SHA_URL = GITHUB_URL.format(repo=get_repository(origin_url), sha=latest_sha1())
+
+    req = urllib2.Request(SHA_URL)
+    req.add_header('Authorization', 'bearer %s' % github_token())
+    resp = urllib2.urlopen(req)
+    content = resp.read()
+    json_response = json.loads(content)
+
+    yellow = lambda x: colorize.make(x).yellow  # noqa
+    blue = lambda x: colorize.make(x).blue  # noqa
+    green = lambda x: colorize.make(x).green  # noqa
+    red = lambda x: colorize.make(x).red  # noqa
+    bold = lambda x: colorize.make(x).bold  # noqa
+
+    state = {
+        'pending': yellow,
+        'success': green,
+        'failure': red
+    }
+
+    # contexts are keys
+    contexts = set([i['context'] for i in json_response])
+
+    for context in contexts:
+        # get all the same-context objects so that they can be sorted by time
+        context_group = [i for i in json_response if i['context'] == context]
+        # now pick up the latest one
+        base_timestamp = time.strptime(context_group[0]['updated_at'],"%Y-%m-%dT%H:%M:%SZ")
+        newest = None
+        latest = None
+        for item in context_group:
+            item_timestamp = time.strptime(context_group[0]['updated_at'],"%Y-%m-%dT%H:%M:%SZ")
+            if item_timestamp > newest:
+                newest = item_timestamp
+                latest = item
+
+        if with_passing:
+            if latest['state'] == u'success':
+                report(latest)
+        elif with_failing:
+            if latest['state'] == u'failure':
+                report(latest)
+        elif default_reporting:
+            report(latest)
+
+
+if __name__ == '__main__':
+    main()
