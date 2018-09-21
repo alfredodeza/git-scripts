@@ -1,0 +1,170 @@
+#!/usr/bin/env python
+
+from __future__ import print_function
+import argparse
+import json
+import os
+import urllib2
+import subprocess
+import sys
+import time
+
+with_url = '--url' in sys.argv
+with_passing = '--passing' in sys.argv
+with_failing = '--failing' in sys.argv
+default_reporting = not(with_passing and with_failing)
+
+class colorize(str):
+    """
+    Pretty simple to use::
+
+        colorize.make('foo').bold
+        colorize.make('foo').green
+        colorize.make('foo').yellow
+        colorize.make('foo').red
+        colorize.make('foo').blue
+
+    Otherwise you could go the long way (for example if you are
+    testing this class)::
+
+        string = colorize('foo')
+        string._set_attributes()
+        string.red
+
+    """
+
+    def __init__(self, string):
+        self.stdout = sys.__stdout__
+        self.appends = ''
+        self.prepends = ''
+        self.isatty = self.stdout.isatty()
+
+    def _set_attributes(self):
+        """
+        Sets the attributes here because the str class does not
+        allow to pass in anything other than a string to the constructor
+        so we can't really mess with the other attributes.
+        """
+        for k, v in self.__colors__.items():
+            setattr(self, k, self.make_color(v))
+
+    def make_color(self, color):
+        if not self.isatty:
+            return self
+        return color + self + '\033[0m' + self.appends
+
+    @property
+    def __colors__(self):
+        return dict(
+            blue='\033[34m',
+            green='\033[92m',
+            yellow='\033[33m',
+            red='\033[91m',
+            bold='\033[1m',
+            ends='\033[0m'
+        )
+
+    @classmethod
+    def make(cls, string):
+        """
+        A helper method to return itself and workaround the fact that
+        the str object doesn't allow extra arguments passed in to the
+        constructor
+        """
+        obj = cls(string)
+        obj._set_attributes()
+        return obj
+
+
+GITHUB_URL = "https://api.github.com/repos/{repo}/statuses/{sha}"
+
+
+def run(cmd):
+    process = subprocess.Popen(
+        cmd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        stdin=subprocess.PIPE,
+        close_fds=True
+    )
+    returncode = process.wait()
+    if returncode != 0:
+        print("Non-zero exit status from calling command %s" % ' '.join(cmd))
+
+    return process.stdout.read(), process.stderr.read(), returncode
+
+
+def get_repository():
+    stdout, _, _ = run(['git', 'config', 'remote.origin.url'])
+    if '@' in stdout:
+        # e.g. something like git@github.com:ceph/ceph.git
+        return stdout.split(':')[-1].split('.git')[0]
+
+def latest_sha1():
+    stdout, _, _ = run(['git', 'rev-parse', 'HEAD'])
+    return stdout.strip('\n')
+
+def github_token():
+    with open(os.path.expanduser('~/.github_token'), 'r') as fp:
+        return fp.read().strip()
+
+def report(test):
+    state_color = state.get(test['state'], 'pending')
+    context = state_color(test.get('context', '?'))
+    if with_url:
+        print(context)
+        print('    ', test.get('target_url'))
+    else:
+        print(context)
+    #if not tests:
+    #    return
+    #for status in tests:
+    #    state_color = state.get(status['state'], 'pending')
+    #    context = state_color(status.get('context', '?'))
+    #    print(context)
+    #    #print(context, ' ', status['target_url'])
+
+SHA_URL = GITHUB_URL.format(repo=get_repository(), sha=latest_sha1())
+
+req = urllib2.Request(SHA_URL)
+req.add_header('Authorization', 'bearer %s' % github_token())
+resp = urllib2.urlopen(req)
+content = resp.read()
+json_response = json.loads(content)
+
+yellow = lambda x: colorize.make(x).yellow  # noqa
+blue = lambda x: colorize.make(x).blue  # noqa
+green = lambda x: colorize.make(x).green  # noqa
+red = lambda x: colorize.make(x).red  # noqa
+bold = lambda x: colorize.make(x).bold  # noqa
+
+state = {
+    'pending': yellow,
+    'success': green,
+    'failure': red
+}
+
+# contexts are keys
+contexts = set([i['context'] for i in json_response])
+
+for context in contexts:
+    # get all the same-context objects so that they can be sorted by time
+    context_group = [i for i in json_response if i['context'] == context]
+    # now pick up the latest one
+    base_timestamp = time.strptime(context_group[0]['updated_at'],"%Y-%m-%dT%H:%M:%SZ")
+    newest = None
+    latest = None
+    for item in context_group:
+        item_timestamp = time.strptime(context_group[0]['updated_at'],"%Y-%m-%dT%H:%M:%SZ")
+        if item_timestamp > newest:
+            newest = item_timestamp
+            latest = item
+
+    if with_passing:
+        if latest['state'] == u'success':
+            report(latest)
+    elif with_failing:
+        if latest['state'] == u'failure':
+            report(latest)
+    elif default_reporting:
+        report(latest)
