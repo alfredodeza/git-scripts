@@ -1,0 +1,299 @@
+#!/usr/bin/env python
+
+from __future__ import print_function
+import json
+import os
+import urllib2
+import subprocess
+import sys
+import time
+from jenkins import Jenkins
+
+with_url = '--url' in sys.argv
+with_passing = '--passing' in sys.argv
+with_failing = '--failing' in sys.argv
+default_reporting = not(with_passing and with_failing)
+
+
+GITHUB_URL = "https://api.github.com/repos/{repo}/statuses/{sha}"
+GITHUB_PULL_URL = "https://api.github.com/repos/{project}/{repo}/pulls?head={head}&state=all"
+GITHUB_FORK_PULL_URL = "https://api.github.com/repos/{project}/{repo}/pulls?head={head}&state=all"
+GITHUB_PR_URL = "https://api.github.com/repos/{project}/{repo}/pulls"
+
+
+
+def run(cmd):
+    print("Running command: %s" % ' '.join(cmd))
+    process = subprocess.Popen(
+        cmd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        stdin=subprocess.PIPE,
+        close_fds=True
+    )
+    returncode = process.wait()
+    if returncode != 0:
+        print("Non-zero exit status from calling command %s" % ' '.join(cmd))
+        print(process.stderr.read())
+        print(process.stdout.read())
+
+    return process.stdout.read(), process.stderr.read(), returncode
+
+
+def get_repository(origin_url):
+    if '@' in origin_url:
+        # e.g. something like git@github.com:ceph/ceph.git
+        return origin_url.split(':')[-1].split('.git')[0].split('/')[-1]
+    else: # assumes http like https://github.com/ceph/ceph
+        return origin_url.split('.com')[-1].strip('/').split('/')[-1]
+
+
+def get_project(origin_url):
+    if '@' in origin_url:
+        # e.g. something like git@github.com:ceph/ceph.git
+        return origin_url.split(':')[-1].split('/')[0]
+    else: # assumes http like https://github.com/ceph/ceph
+        return origin_url.split('.com')[-1].strip('/').split('/')[0]
+
+
+def current_branch():
+    stdout, _, _ = run(['git', 'rev-parse', '--abbrev-ref', 'HEAD'])
+    return stdout.strip('\n')
+
+
+def get_head_param(origin_url):
+    """
+    The API for querying pull requests can be refined with a ``head`` query. The docs say::
+
+        Filter pulls by head user and branch name in the format of user:ref-name
+
+    This function *does not* use the Git "head".
+    """
+    user = os.getenv('GITHUB_USER', '')
+    if user:
+        return "%s:%s" % (user, current_branch())
+
+    if '@' in origin_url:
+        # e.g. something like git@github.com:ceph/ceph.git
+        user = origin_url.split(':')[-1].split('/')[0]
+    else: # assumes http like https://github.com/ceph/ceph
+        user = origin_url.split('.com')[-1].strip('/').split('/')[0]
+    return "%s:%s" % (user, current_branch())
+
+
+def latest_sha1():
+    stdout, _, _ = run(['git', 'rev-parse', 'HEAD'])
+    return stdout.strip('\n')
+
+
+def get_api_commits(pull_url):
+    pull_url = "%s/commits" % pull_url
+
+    req = urllib2.Request(pull_url)
+    req.add_header('Authorization', 'bearer %s' % github_token())
+    try:
+        resp = urllib2.urlopen(req)
+    except Exception as error:
+        print(error)
+        print(pull_url)
+        raise SystemExit('could not fetch commits')
+    content = resp.read()
+    import ipdb; ipdb.set_trace()
+    result = json.loads(content)
+    commits = [i['sha'] for i in result]
+    if commits > 1:
+        return "%s^..%s" % (commits[0], commits[-1])
+    return commits[-1]
+
+
+def commit_range():
+    """
+    Find the commit range for cherry-picking
+    .. warning:: This assumes master branch always
+    """
+    stdout, _, _ = run(['git', 'log', '--format=format:%H', 'master..HEAD'])
+    lines = [l.strip() for l in stdout.split('\n') if l]
+    if not lines:
+        # it must've been merged already, must contact the Github API to get commits
+        return None
+
+    if lines > 1:
+        return "%s^..%s" % (lines[-1], lines[0])
+    return lines[0]
+
+
+def checkout(branch_name):
+    """
+    Create a new branch to backport stuff
+    """
+    run(['git', 'checkout', '-b', branch_name])
+
+
+def github_token():
+    with open(os.path.expanduser('~/.github_token'), 'r') as fp:
+        return fp.read().strip()
+
+
+def parse_pull_request(json, branch=None):
+    """
+    From the JSON output, parse out the pull request id so that it can be used
+    by Jenkins jobs that require the pull request in the form of::
+
+        origin/pr/72/head
+
+"head": {
+      "label": "thmour:thmour_parallel_create",
+      "ref": "thmour_parallel_create",
+    """
+    if isinstance(json, list):
+        for pr in json:
+            if pr['head']['ref'] == branch:
+                url = pr['html_url']
+    else:
+        try:
+            # XXX assumes the first one is the one we want, might need to further improve this
+            # to verify it is correct
+            url = json[0]['html_url']
+        except KeyError:
+            raise SystemExit('Unable to parse html_url from json')
+
+    pr_id = url.split('/')[-1]
+    return 'origin/pr/%s/head' % pr_id
+
+
+def report(test):
+    state_color = state.get(test['state'], 'pending')
+    context = state_color(test.get('context', '?'))
+    if with_url:
+        print(context)
+        print('    ', test.get('target_url'))
+    else:
+        print(context)
+
+
+def test_list(tagged_jobs, informational=True):
+    jobs = []
+    if 'list' in sys.argv:
+        unsplit_tags = sys.argv[sys.argv.index('list') + 1:]
+    else: # assume that we are testing for specific tags:
+        unsplit_tags = sys.argv[sys.argv.index('test') + 1:]
+    if not unsplit_tags:
+        if not informational:
+            return tagged_jobs.keys()
+        # list everything
+        for job in tagged_jobs.keys():
+            print(job)
+    else:
+        tags = parse_arg_tags(unsplit_tags)
+        for job, job_description in tagged_jobs.items():
+            mismatch = False
+            for tag in tags:
+                if tag not in job_description['tags']:
+                    mismatch = True
+            if not mismatch:
+                jobs.append(job)
+        if informational:
+            for job in set(jobs):
+                print(job)
+        return set(jobs)
+
+
+def pr_json(pull_url):
+    req = urllib2.Request(pull_url)
+    req.add_header('Authorization', 'bearer %s' % github_token())
+    try:
+        resp = urllib2.urlopen(req)
+    except Exception as error:
+        print(error)
+        print(pull_url)
+        return []
+    content = resp.read()
+    return json.loads(content)
+
+
+def create_pr(pull_url, data):
+    req = urllib2.Request(pull_url, data=json.dumps(data))
+    req.add_header('Authorization', 'bearer %s' % github_token())
+    req.add_header('Content-Type', 'application/json')
+    try:
+        resp = urllib2.urlopen(req)
+    except Exception as error:
+        print(error)
+        print(pull_url)
+        return []
+    content = resp.read()
+    return json.loads(content)
+
+
+def main():
+    target_backport = sys.argv[-1]
+    branch = current_branch()
+    origin_url, _, _ = run(['git', 'config', 'remote.origin.url'])
+    upstream_url, _, _ = run(['git', 'config', 'remote.upstream.url'])
+    origin_project = get_project(origin_url) or 'ceph'
+    upstream_project = get_project(upstream_url) or 'ceph'
+    repo = get_repository(origin_url)
+    head = get_head_param(origin_url)
+    upstream_head = get_head_param(upstream_url)
+
+    PULL_URL = GITHUB_PULL_URL.format(project=origin_project, repo=repo, head=head)
+    json_response = pr_json(PULL_URL)
+    preferred_url = origin_url
+
+    if json_response == []:
+        PULL_URL = GITHUB_FORK_PULL_URL.format(project=upstream_project, repo=repo, head=head)
+        json_response = pr_json(PULL_URL)
+        preferred_url = origin_url
+
+    # try with just the upstream
+    if json_response == []:
+        PULL_URL = GITHUB_FORK_PULL_URL.format(project=upstream_project, repo=repo, head=upstream_head)
+        json_response = pr_json(PULL_URL)
+        preferred_url = upstream_url
+
+    # give up with no json to work with
+    if json_response == []:
+        print("unable to gather JSON from PR %s" % PULL_URL)
+        raise SystemExit(1)
+    pr_api_url = json_response[0]['url']
+    master_pr = json_response[0]['html_url']
+    body = json_response[0]['body']
+    title = json_response[0]['title']
+    backport_title = "%s %s" % (target_backport, title)
+    backport_line = "Backport of: %s" % master_pr
+    backport_body = "%s\n%s" % (body, backport_line)
+
+    target_branch = json_response[0]['base']['ref']
+    commits = commit_range()
+    if not commits:
+        commits = get_api_commits(pr_api_url)
+    if '--pu' in sys.argv:
+        run(['git', 'pu', target_backport])
+    else:
+        run(['git', 'checkout', target_backport])
+    backport_branch = "%s-%s" % (target_backport, branch.split('wip-')[-1])
+    checkout(backport_branch)
+    _, _, returncode = run(['git', 'cherry-pick', '-x', commits])
+    if returncode != 0:
+        raise SystemExit('Unable to proceed with cherry-pick, aborting...')
+    run(['git', 'push', '-u', 'origin', backport_branch])
+    data = {
+        'title': backport_title,
+        'body': backport_body,
+        'head': get_head_param(preferred_url),
+        'base': target_backport,
+    }
+    from pprint import pprint
+#    pprint(data)
+    result = create_pr(
+        GITHUB_PR_URL.format(project=upstream_project, repo=repo),
+        data=data
+    )
+    pprint(result)
+    #pprint(json_response[0])
+    #print("Pull Request URL: %s" % json_response[0]['html_url'])
+
+
+
+if __name__ == '__main__':
+    main()
